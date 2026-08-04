@@ -1,152 +1,156 @@
-const { google } = require("googleapis");
-const User = require("../models/User");
 const Calendar = require("../models/Calendar");
-const { colorPalette } = require("../config/colors");
+const { palette } = require("../config/colors");
+const { getCalendarClient } = require("../config/googleCalendar");
+
+async function listServiceAccountCalendars(calendarClient) {
+  const calendars = [];
+  let pageToken;
+
+  do {
+    const response = await calendarClient.calendarList.list({
+      maxResults: 250,
+      pageToken,
+    });
+    calendars.push(...(response.data.items || []));
+    pageToken = response.data.nextPageToken;
+  } while (pageToken);
+
+  return calendars;
+}
+
+async function discoverCalendars() {
+  const calendarClient = getCalendarClient();
+  const existingCalendars = await Calendar.find();
+  const existingByGoogleId = new Map(
+    existingCalendars.map((calendar) => [calendar.googleId, calendar])
+  );
+  const discoveredByGoogleId = new Map();
+
+  const visibleCalendars = await listServiceAccountCalendars(calendarClient);
+  visibleCalendars.forEach((calendar) => {
+    discoveredByGoogleId.set(calendar.id, {
+      googleId: calendar.id,
+      name: calendar.summary || "Unnamed Calendar",
+      color: calendar.backgroundColor,
+      accessRole: calendar.accessRole,
+    });
+  });
+
+  const storedOnlyIds = existingCalendars
+    .map((calendar) => calendar.googleId)
+    .filter((calendarId) => !discoveredByGoogleId.has(calendarId));
+
+  const storedResults = await Promise.allSettled(
+    storedOnlyIds.map(async (calendarId) => {
+      const response = await calendarClient.calendars.get({ calendarId });
+      return {
+        googleId: calendarId,
+        name: response.data.summary || "Unnamed Calendar",
+      };
+    })
+  );
+
+  storedResults.forEach((result) => {
+    if (result.status === "fulfilled") {
+      discoveredByGoogleId.set(result.value.googleId, result.value);
+    }
+  });
+
+  const savedCalendars = [];
+  let colorIndex = 0;
+
+  for (const discovered of discoveredByGoogleId.values()) {
+    const existing = existingByGoogleId.get(discovered.googleId);
+    const saved = await Calendar.findOneAndUpdate(
+      { googleId: discovered.googleId },
+      {
+        $set: {
+          name: discovered.name,
+          color:
+            discovered.color ||
+            existing?.color ||
+            palette[colorIndex % palette.length],
+          accessRole:
+            discovered.accessRole || existing?.accessRole || "reader",
+        },
+      },
+      { new: true, upsert: true, setDefaultsOnInsert: true }
+    );
+    savedCalendars.push(saved);
+    colorIndex += 1;
+  }
+
+  return savedCalendars;
+}
 
 const calendarController = {
   getCalendars: async (req, res) => {
     try {
-      if (!req.user) {
-        return res.status(401).json({ message: "User not authenticated" });
-      }
-
-      const user = await User.findOne({ googleId: req.user.googleId });
-
-      if (!user || !user.accessToken) {
-        return res
-          .status(401)
-          .json({ message: "Access token not found, please re-authenticate" });
-      }
-
-      const oauth2Client = new google.auth.OAuth2(
-        process.env.GOOGLE_CLIENT_ID,
-        process.env.GOOGLE_CLIENT_SECRET,
-        process.env.CALLBACK_URL
-      );
-      oauth2Client.setCredentials({
-        access_token: user.accessToken,
-        refresh_token: user.refreshToken,
-      });
-
-      const calendar = google.calendar({ version: "v3", auth: oauth2Client });
-      const response = await calendar.calendarList.list();
-
-      if (response.data && response.data.items) {
-        // Fetch existing calendars for the user
-        const existingCalendars = await Calendar.find({ user: user._id });
-
-        // Create a map of existing calendar colors by Google ID
-        const existingColorMap = {};
-        existingCalendars.forEach((cal) => {
-          existingColorMap[cal.googleId] = cal.color;
-        });
-
-        // Assign colors to new calendars
-        const calendarsToSave = response.data.items.map((item, index) => {
-          const color =
-            existingColorMap[item.id] ||
-            colorPalette[index % colorPalette.length]; // Wrap around palette if needed
-
-          return {
-            googleId: item.id,
-            name: item.summary || "Unnamed Calendar", // Use default if summary is missing
-            user: user._id,
-            color,
-            accessRole: item.accessRole,
-          };
-        });
-
-        // Remove old calendars for this user
-        await Calendar.deleteMany({ user: user._id });
-
-        // Save new calendars to the database
-        const savedCalendars = await Calendar.insertMany(calendarsToSave);
-
-        // Prepare response for the frontend
-        const calendarsForResponse = savedCalendars.map((calendar) => ({
+      const calendars = await discoverCalendars();
+      res.json(
+        calendars.map((calendar) => ({
+          _id: calendar._id,
           id: calendar.googleId,
+          googleId: calendar.googleId,
           name: calendar.name,
           color: calendar.color,
           accessRole: calendar.accessRole,
-        }));
-
-        res.json(calendarsForResponse);
-      } else {
-        console.warn("No calendars found in Google API response");
-        res.json([]);
-      }
+          selected: calendar.selected,
+        }))
+      );
     } catch (error) {
       console.error("Error fetching calendars:", error);
-      res
-        .status(500)
-        .json({ message: "Error fetching calendars", details: error.message });
+      res.status(502).json({
+        message: "Error fetching calendars from Google",
+        details: error.message,
+      });
     }
   },
+
   getEvents: async (req, res) => {
     try {
       const { calendarId } = req.params;
+      const storedCalendar = await Calendar.findOne({ googleId: calendarId });
 
-      // Retrieve the user's tokens (stored during authentication)
-      const user = req.user; // Assuming req.user is populated
-      if (!user) {
-        return res.status(401).json({ message: "User not authenticated" });
+      if (!storedCalendar) {
+        return res.status(404).json({ message: "Calendar not found" });
       }
 
-      const oauth2Client = new google.auth.OAuth2(
-        process.env.GOOGLE_CLIENT_ID,
-        process.env.GOOGLE_CLIENT_SECRET,
-        process.env.CALLBACK_URL
-      );
-
-      oauth2Client.setCredentials({
-        access_token: user.accessToken,
-        refresh_token: user.refreshToken,
+      const calendarClient = getCalendarClient();
+      const response = await calendarClient.events.list({
+        calendarId,
+        maxResults: 2500,
+        singleEvents: true,
+        orderBy: "startTime",
       });
 
-      const calendar = google.calendar({ version: "v3", auth: oauth2Client });
-
-      // Fetch all events without time restrictions
-      const response = await calendar.events.list({
-        calendarId: calendarId, // ID of the calendar to fetch events from
-        maxResults: 2500, // Adjust as needed; default is 2500
-        singleEvents: true, // Ensure recurring events are expanded
-        orderBy: "startTime", // Ensure chronological order
-      });
-
-      res.json(response.data.items); // Return the events
+      res.json(response.data.items || []);
     } catch (error) {
       console.error("Error fetching events:", error);
-      res.status(500).json({ message: "Error fetching events" });
+      res.status(error.code === 403 ? 403 : 502).json({
+        message: "Error fetching events from Google",
+        details: error.message,
+      });
     }
   },
-  getCalendarsByUserId: async (req, res) => {
-    try {
-      const userId = req.params.userId;
 
-      let calendars;
-      if (userId === "all") {
-        // Fetch all calendars if userId is "all"
-        calendars = await Calendar.find();
-      } else {
-        // Otherwise, fetch calendars for the specific user
-        calendars = await Calendar.find({ user: userId });
-      }
-
-      res.json(calendars);
-    } catch (error) {
-      console.error("Error fetching calendars:", error);
-      res.status(500).json({ message: "Error fetching calendars" });
-    }
-  },
   updateCalendarSelections: async (req, res) => {
     try {
-      const { calendars } = req.body; // Array of calendars with updated `selected` field
-      for (const calendar of calendars) {
-        await Calendar.findByIdAndUpdate(calendar._id, {
-          selected: calendar.selected,
-        });
-      }
-      res.status(200).json({ message: "Selections updated successfully" });
+      const calendars = Array.isArray(req.body.calendars)
+        ? req.body.calendars
+        : [];
+
+      await Promise.all(
+        calendars
+          .filter((calendar) => calendar._id)
+          .map((calendar) =>
+            Calendar.findByIdAndUpdate(calendar._id, {
+              selected: Boolean(calendar.selected),
+            })
+          )
+      );
+
+      res.json({ message: "Selections updated successfully" });
     } catch (error) {
       console.error("Error updating calendar selections:", error);
       res.status(500).json({ message: "Failed to update calendar selections" });
