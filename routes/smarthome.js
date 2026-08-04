@@ -1,6 +1,7 @@
 const express = require("express");
-const router = express.Router();
 const {
+  controlDevice,
+  getDeviceStatus,
   getDevices,
   syncDevices,
   reportState,
@@ -8,39 +9,35 @@ const {
 } = require("../controllers/smarthomeController");
 const Devices = require("../models/Devices");
 
-require("dotenv").config();
+const router = express.Router();
 
-router.use(ensureAuthenticated); // Ensure API token is present
+router.use(ensureAuthenticated);
 
-// **Sync Devices with Home Assistant and Store in MongoDB**
 router.get("/sync-devices", syncDevices);
-
-// **Fetch All Devices (Live from Home Assistant)**
 router.get("/devices", getDevices);
+router.get("/devices/:deviceId/status", getDeviceStatus);
+router.post("/devices/:deviceId/state", controlDevice);
 
-// **Fetch Only Placed Devices (From MongoDB)**
 router.get("/placed-devices", async (req, res) => {
   try {
     const placedDevices = await Devices.find({ placed: true, removed: false });
     res.json(placedDevices);
   } catch (error) {
-    console.error("❌ Error fetching placed devices:", error.message);
+    console.error("Error fetching placed devices:", error.message);
     res.status(500).json({ error: "Failed to fetch placed devices" });
   }
 });
 
-// **Fetch Removed Devices**
 router.get("/removed-devices", async (req, res) => {
   try {
     const removedDevices = await Devices.find({ removed: true });
     res.json(removedDevices);
   } catch (error) {
-    console.error("❌ Error fetching removed devices:", error.message);
+    console.error("Error fetching removed devices:", error.message);
     res.status(500).json({ error: "Failed to fetch removed devices" });
   }
 });
 
-// **Update Device Placement**
 router.post("/device-positions", async (req, res) => {
   try {
     const { deviceId, x, y } = req.body;
@@ -55,24 +52,25 @@ router.post("/device-positions", async (req, res) => {
       { new: true, upsert: true }
     );
 
-    res.json({ message: "✅ Device position updated", device: updatedDevice });
+    res.json({ message: "Device position updated", device: updatedDevice });
   } catch (error) {
-    console.error("❌ Error updating device position:", error.message);
+    console.error("Error updating device position:", error.message);
     res.status(500).json({ error: "Failed to update position" });
   }
 });
 
-// **Report Device State Change to Home Assistant**
+// Backwards-compatible endpoint for existing clients.
 router.post("/report-state", reportState);
 
-// **Manually Remove a Device (Permanently)**
 router.delete("/remove-device/:deviceId", async (req, res) => {
   try {
-    const { deviceId } = req.params;
-    await Devices.deleteOne({ deviceId, removed: true });
-    res.json({ message: `✅ Device ${deviceId} permanently deleted` });
+    await Devices.deleteOne({
+      deviceId: req.params.deviceId,
+      removed: true,
+    });
+    res.json({ message: "Device permanently deleted" });
   } catch (error) {
-    console.error("❌ Error deleting device:", error.message);
+    console.error("Error deleting device:", error.message);
     res.status(500).json({ error: "Failed to delete device" });
   }
 });
