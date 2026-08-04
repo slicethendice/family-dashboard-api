@@ -2,19 +2,15 @@ require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
-const session = require("express-session");
-const MongoStore = require("connect-mongo");
 const mongoose = require("mongoose");
-const passport = require("passport");
-const cookieParser = require("cookie-parser");
 const routes = require("./routes");
 const connectDB = require("./config/database");
 
-require("./config/passport");
-
 const app = express();
-
-const requiredEnvironmentVariables = ["MONGO_URI", "SESSION_SECRET"];
+const requiredEnvironmentVariables = [
+  "MONGO_URI",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+];
 
 function validateEnvironment() {
   const missing = requiredEnvironmentVariables.filter(
@@ -40,7 +36,6 @@ function configureApp() {
 
   app.use(
     cors({
-      credentials: true,
       origin(origin, callback) {
         if (!origin || allowedOrigins.includes(origin)) {
           return callback(null, true);
@@ -50,31 +45,8 @@ function configureApp() {
     })
   );
 
-  app.use(cookieParser());
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
-
-  app.use(
-    session({
-      secret: process.env.SESSION_SECRET,
-      resave: false,
-      saveUninitialized: false,
-      store: MongoStore.create({
-        mongoUrl: process.env.MONGO_URI,
-        collectionName: "sessions",
-        autoRemove: "native",
-      }),
-      cookie: {
-        secure: process.env.NODE_ENV === "production",
-        httpOnly: true,
-        sameSite: "lax",
-        maxAge: 14 * 24 * 60 * 60 * 1000,
-      },
-    })
-  );
-
-  app.use(passport.initialize());
-  app.use(passport.session());
 
   app.get("/health", (req, res) => {
     const databaseConnected = mongoose.connection.readyState === 1;
