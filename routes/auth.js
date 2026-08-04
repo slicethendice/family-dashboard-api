@@ -1,8 +1,9 @@
 const express = require("express");
 const passport = require("passport");
-const router = express.Router();
 
-// Redirect to Google OAuth
+const router = express.Router();
+const clientOrigin = process.env.CLIENT_ORIGIN || "http://localhost:8080";
+
 router.get(
   "/google",
   passport.authenticate("google", {
@@ -12,30 +13,29 @@ router.get(
   })
 );
 
-// Handle Google OAuth callback
-router.get(
-  "/oauth/callback",
+const handleGoogleCallback = [
   passport.authenticate("google", {
-    failureRedirect: "/",
+    failureRedirect: `${clientOrigin}/settings?auth=failed`,
   }),
-  (req, res) => {
-    req.session.user = req.user; // Store user info in session
-    req.session.save(() => {
-      res.redirect("http://localhost:8080/"); // Redirect to the frontend
+  (req, res, next) => {
+    req.session.save((error) => {
+      if (error) {
+        return next(error);
+      }
+      res.redirect(`${clientOrigin}/calendar`);
     });
-  }
-);
+  },
+];
 
-// Ensure the user is authenticated
-const ensureAuthenticated = (req, res, next) => {
-  if (req.isAuthenticated() && req.user) {
-    return next();
-  } else {
-    res.status(401).json({ authenticated: false });
-  }
-};
+router.get("/google/callback", ...handleGoogleCallback);
+// Preserve the original callback while local Google settings are migrated.
+router.get("/oauth/callback", ...handleGoogleCallback);
 
-router.get("/user", ensureAuthenticated, (req, res) => {
+router.get("/user", (req, res) => {
+  if (!req.isAuthenticated() || !req.user) {
+    return res.json({ authenticated: false });
+  }
+
   res.json({
     authenticated: true,
     id: req.user.id,
@@ -43,6 +43,35 @@ router.get("/user", ensureAuthenticated, (req, res) => {
     email: req.user.email,
   });
 });
+
+router.post("/logout", (req, res, next) => {
+  req.logout((logoutError) => {
+    if (logoutError) {
+      return next(logoutError);
+    }
+
+    req.session.destroy((sessionError) => {
+      if (sessionError) {
+        return next(sessionError);
+      }
+
+      res.clearCookie("connect.sid", {
+        httpOnly: true,
+        sameSite: "lax",
+        secure: process.env.NODE_ENV === "production",
+      });
+      res.json({ authenticated: false });
+    });
+  });
+});
+
+const ensureAuthenticated = (req, res, next) => {
+  if (req.isAuthenticated() && req.user) {
+    return next();
+  }
+
+  return res.status(401).json({ authenticated: false });
+};
 
 module.exports = {
   router,
