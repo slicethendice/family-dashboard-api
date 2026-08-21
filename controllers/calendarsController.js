@@ -18,6 +18,56 @@ async function listServiceAccountCalendars(calendarClient) {
   return calendars;
 }
 
+async function listCalendarEvents(calendarClient, calendarId, timeMin, timeMax) {
+  const events = [];
+  let pageToken;
+
+  do {
+    const response = await calendarClient.events.list({
+      calendarId,
+      timeMin,
+      timeMax,
+      maxResults: 2500,
+      pageToken,
+      singleEvents: true,
+      orderBy: "startTime",
+    });
+    events.push(...(response.data.items || []));
+    pageToken = response.data.nextPageToken;
+  } while (pageToken);
+
+  return events;
+}
+
+function parseEventRange(query) {
+  const { timeMin, timeMax } = query;
+  const start = new Date(timeMin);
+  const end = new Date(timeMax);
+
+  if (
+    !timeMin ||
+    !timeMax ||
+    Number.isNaN(start.getTime()) ||
+    Number.isNaN(end.getTime()) ||
+    start >= end
+  ) {
+    const error = new Error(
+      "timeMin and timeMax must be valid ISO dates and timeMin must precede timeMax"
+    );
+    error.status = 400;
+    throw error;
+  }
+
+  const maximumRangeMs = 366 * 24 * 60 * 60 * 1000;
+  if (end - start > maximumRangeMs) {
+    const error = new Error("Calendar event ranges cannot exceed 366 days");
+    error.status = 400;
+    throw error;
+  }
+
+  return { timeMin: start.toISOString(), timeMax: end.toISOString() };
+}
+
 async function discoverCalendars() {
   const calendarClient = getCalendarClient();
   const existingCalendars = await Calendar.find();
@@ -110,6 +160,7 @@ const calendarController = {
   getEvents: async (req, res) => {
     try {
       const { calendarId } = req.params;
+      const { timeMin, timeMax } = parseEventRange(req.query);
       const storedCalendar = await Calendar.findOne({ googleId: calendarId });
 
       if (!storedCalendar) {
@@ -117,19 +168,22 @@ const calendarController = {
       }
 
       const calendarClient = getCalendarClient();
-      const response = await calendarClient.events.list({
+      const events = await listCalendarEvents(
+        calendarClient,
         calendarId,
-        maxResults: 2500,
-        singleEvents: true,
-        orderBy: "startTime",
-      });
+        timeMin,
+        timeMax
+      );
 
-      res.json(response.data.items || []);
+      res.json(events);
     } catch (error) {
       console.error("Error fetching events:", error);
-      res.status(error.code === 403 ? 403 : 502).json({
-        message: "Error fetching events from Google",
-        details: error.message,
+      res.status(error.status || (error.code === 403 ? 403 : 502)).json({
+        message:
+          error.status === 400
+            ? error.message
+            : "Error fetching events from Google",
+        details: error.status === 400 ? undefined : error.message,
       });
     }
   },
@@ -159,3 +213,5 @@ const calendarController = {
 };
 
 module.exports = calendarController;
+module.exports.listCalendarEvents = listCalendarEvents;
+module.exports.parseEventRange = parseEventRange;
